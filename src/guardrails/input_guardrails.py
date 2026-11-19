@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,67 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Ký tự vô hình / định dạng hay dùng để tách từ khoá và né regex
+_INVISIBLE_RE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠎"
+    "​-‏‪-‮⁠-⁯ㅤ︀-️﻿]"
+)
+
+
+def normalize_text(text: str) -> str:
+    """Canonicalize text before matching.
+
+    - NFKC: fullwidth / ký tự trang trí (ｉｇｎｏｒｅ, 𝐢𝐠𝐧𝐨𝐫𝐞) → ASCII
+    - Xoá zero-width / bidi / soft-hyphen (``Ignore\\u200b all``)
+    - Bỏ dấu tiếng Việt (``bỏ qua`` → ``bo qua``, ``đ`` → ``d``)
+    - Gộp khoảng trắng, chữ thường
+    """
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = _INVISIBLE_RE.sub("", text)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = re.sub(r"\s+", " ", text)
+    return text.lower().strip()
+
+
+# Mỗi pattern chạy trên text đã normalize (chữ thường, không dấu).
+INJECTION_PATTERNS = [
+    # 1. Ghi đè chỉ dẫn: ignore / disregard / forget / override ... instructions
+    r"\b(ignore|disregard|forget|override|bypass|skip)\b.{0,30}?"
+    r"\b(previous|prior|above|earlier|all|any|your|the|system|initial|original)\b.{0,20}?"
+    r"\b(instruction|prompt|rule|directive|guideline|polic|guardrail|restriction)",
+    # 2. Đổi vai: you are now / from now on you are
+    r"\byou are now\b|\bfrom now on,? you (are|will|must)\b",
+    # 3. Nhắc tới system prompt / hidden instructions
+    r"\b(system|developer|hidden|initial|original)\s+(prompt|message|instruction)s?\b",
+    # 4. Đòi lộ chỉ dẫn / cấu hình
+    r"\b(reveal|show|print|repeat|output|display|leak|dump|expose|tell me)\b.{0,25}?"
+    r"\byour\b.{0,15}?\b(instruction|prompt|rule|config|configuration)s?\b",
+    # 5. Giả danh / nhập vai không giới hạn
+    r"\bpretend (you are|to be|you'?re)\b",
+    r"\bact as\b.{0,20}?\b(unrestricted|unfiltered|uncensored|jailbroken|evil|dan)\b",
+    r"\b(dan|developer|god|jailbreak|unrestricted)\s+mode\b",
+    r"\bdo anything now\b",
+    # 6. Đòi secret nội bộ (credential, API key, DB host)
+    r"\b(admin|root|internal|system|database|db)\s+(password|passwd|credential|api key|key|host)s?\b",
+    r"\b(reveal|show|print|give|leak|dump|expose|tell|send|share|list|export)\b.{0,40}?"
+    r"\b(api[\s_-]?key|secret|credential|access token)s?\b",
+    # 7. Chèn token định dạng chat / role giả
+    r"<\|?(system|im_start|im_end)\|?>|\[/?(system|inst)\]|^\s*(system|assistant)\s*:",
+    # 8. SQL injection / lệnh phá dữ liệu nhét trong câu hỏi
+    r"\b(drop|truncate|alter)\s+table\b|\bunion\s+(all\s+)?select\b|;\s*--|\bor\s+1\s*=\s*1\b",
+    # 9. Tiếng Việt (đã bỏ dấu)
+    r"\b(bo qua|phot lo|quen|vo hieu)\b.{0,30}?\b(chi dan|huong dan|lenh|quy tac|chi thi)\b",
+    r"\b(tiet lo|cho (toi|tao|minh) (xem|biet)|in ra)\b.{0,30}?"
+    r"\b(mat khau|api key|prompt|chi dan he thong|bi mat)\b",
+    r"\bban (bay gio )?la\b.{0,20}?\b(khong gioi han|khong bi rang buoc|dan)\b",
+]
+_INJECTION_RES = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +113,13 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
+    normalized = normalize_text(user_input)
+    # Bản thứ hai: bỏ dấu chấm/gạch xen giữa chữ ("i.g.n.o.r.e" → "ignore",
+    # "sys-tem" → "system") và đổi "_" thành khoảng trắng.
+    collapsed = re.sub(r"(?<=\w)[.\-*](?=\w)", "", normalized).replace("_", " ")
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    for rx in _INJECTION_RES:
+        if rx.search(normalized) or rx.search(collapsed):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +145,35 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    # Bỏ dấu để "tài khoản" khớp "tai khoan" trong config
+    input_lower = normalize_text(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Topic cấm → BLOCK (khớp đầu từ: "hacker" bị chặn, "skill" không dính "kill")
+    for topic in BLOCKED_TOPICS:
+        if re.search(rf"\b{re.escape(topic)}", input_lower):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Không dính topic banking nào → BLOCK
+    on_topic = any(
+        re.search(rf"\b{re.escape(t)}", input_lower) for t in ALLOWED_TOPICS
+    ) or any(
+        # Từ bổ sung: khớp nguyên từ để "fee" không dính "feel"
+        re.search(rf"\b{re.escape(t)}s?\b", input_lower) for t in _EXTRA_ALLOWED_TOPICS
+    )
+    if not on_topic:
+        return "BLOCK"
+
+    # 3. Banking hợp lệ
+    return "ALLOW"
+
+
+# Bổ sung vài từ banking hay gặp mà config chưa có (đều là chữ thường, không dấu)
+_EXTRA_ALLOWED_TOPICS = [
+    "bank", "vinbank", "card", "mortgage", "fee", "otp", "statement",
+    "wire", "remittance", "exchange rate", "currency",
+    "the ghi no", "khoan vay", "rut tien", "nap tien", "sao ke",
+    "bieu phi", "phi giao dich", "phi thuong nien",
+]
 
 
 # ============================================================
@@ -104,6 +186,9 @@ def topic_filter(user_input: str) -> InputStatus:
 #   - user_message is types.Content (not str)
 #   - Return types.Content to block, or None to pass through
 # ============================================================
+
+MAX_INPUT_CHARS = 2000
+
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
@@ -144,14 +229,39 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 0. Input rỗng / quá dài (chống nhồi prompt + tốn chi phí)
+        if not text.strip():
+            self.blocked_count += 1
+            return self._block_response(
+                "[BLOCKED: empty_input] Vui lòng nhập câu hỏi về dịch vụ ngân hàng."
+            )
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            return self._block_response(
+                f"[BLOCKED: input_too_long] Câu hỏi quá dài (>{MAX_INPUT_CHARS} ký tự). "
+                "Vui lòng rút gọn."
+            )
 
-        pass  # Replace with your implementation
+        # 1. Prompt injection / jailbreak
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "[BLOCKED: prompt_injection] Yêu cầu của bạn chứa chỉ dẫn không "
+                "hợp lệ nên không thể xử lý. Tôi chỉ hỗ trợ các câu hỏi về dịch "
+                "vụ ngân hàng VinBank."
+            )
+
+        # 2. Ngoài phạm vi ngân hàng / chủ đề cấm
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "[BLOCKED: off_topic] Xin lỗi, tôi chỉ hỗ trợ các câu hỏi về "
+                "ngân hàng: tài khoản, giao dịch, chuyển tiền, tiết kiệm, lãi "
+                "suất, khoản vay, thẻ tín dụng."
+            )
+
+        # 3. Cả hai ALLOW → cho qua
+        return None
 
 
 # ============================================================
