@@ -1,5 +1,40 @@
 # Day 11 — Controlled Agent Security (2026)
 
+## 🎓 Bài nộp
+
+| | |
+|---|---|
+| **Họ tên** | Đỗ Phương Nam |
+| **MSSV** | 2A202603621 |
+| **Lớp** | K5 · L3A · Day 11 |
+| **Blue** | Liquid `lfm3-1.7b` (gọi trực tiếp Liquid API qua `LIQUID_API_KEY`; để trống → OpenRouter `liquid/lfm-3-1.7b:free` như mặc định) |
+| **Red / Red Advance** | Gemini `gemini-3.5-flash` (model mặc định) |
+
+**Kết quả** (artifact trong [`outputs/`](outputs/), tự sinh bằng lệnh — không sửa tay):
+
+| Checkpoint | Kết quả |
+|---|---|
+| CP2 — Guardrails | Input: chuẩn hoá Unicode (zero-width, fullwidth, bỏ dấu TV) + ~15 pattern injection + topic filter; Output: redact PII, chặn secret (kể cả base64/hex/đảo ngược) |
+| CP3 — Pipeline | `results.json`: safe bị chặn 0/6 · attack bị chặn 9/10 · rate limit chặn 5/15 · egress allowlist chặn 6/8 case xấu |
+| CP4 — Red team | 5 prompt (completion, translation, hypothetical, confirmation, multi-step) · **Red leak 3/5** · Red Advance 0/5 · chọn bonus **B1** |
+| CP5 — Tự kiểm | smoke 39/39 · public 10/10 · `grade.py`: packaging + schema OK |
+
+**Cách chạy nhanh** (Python 3.12, từ gốc repo):
+
+```powershell
+py -3.12 -m venv .venv; .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env   # điền OPENROUTER_API_KEY (hoặc LIQUID_API_KEY) + GOOGLE_API_KEY
+python src/main.py --part 2   # guardrails
+python src/main.py --part 3   # pipeline → outputs/results.json
+python src/main.py --part 4   # red team → outputs/attack_results.json
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+> Lưu ý: `nemoguardrails` 0.24 chưa hỗ trợ Python 3.14 → dùng Python 3.10–3.13.
+
+---
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
